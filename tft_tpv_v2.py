@@ -180,7 +180,7 @@ TRANSACTION_QUERY = """SELECT
     SUM(CASE WHEN has_fraud_notification IS TRUE THEN 1 ELSE 0 END) AS daily_fraud_amount,
     SUM(CASE WHEN has_dispute IS TRUE THEN 1 ELSE 0 END) AS daily_dispute_amount
 
-FROM `prj-p-dat-datawarehouse-90m9.analytics.transaction`
+FROM `` # google cloud server not listed for privacy reasons
 GROUP BY
     request_date,
     merchant_id
