@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 Temporal Fusion Transformer for daily merchant revenue (v2).
 
@@ -6,23 +5,6 @@ BigQuery query -> preprocess -> TimeSeriesDataSet -> dataloaders -> baseline ->
 Trainer.fit -> best checkpoint -> validation plots -> interpretation -> one future
 forecast per merchant (plus a verbose single-merchant report for whichever id
 ``--forecast-merchant`` names)
-The reasoning behind every change is in MODEL_NOTES.md.  The short version:
-
-  1. The target is log-transformed *in the dataframe* (``revenue_log``) instead of
-     inside the normaliser.  pytorch_forecasting inverts the normaliser's
-     ``transformation`` *before* the loss is evaluated, so a QuantileLoss on a
-     log1p/expm1 GroupNormalizer is still a QuantileLoss in raw GBP - and raw GBP
-     pinball loss is owned entirely by a handful of whale merchants.
-  2. Every merchant is reindexed onto a complete daily calendar and missing days
-     are filled with zero revenue, because "no transactions" is an observation of
-     zero, not a missing value.  ``allow_missing_timesteps`` is therefore off.
-  3. All calendar covariates are derived from the date by one function that is
-     used for history *and* for the future horizon, so the encoder and the decoder
-     can never disagree about what "day_of_week = 5" means.
-  4. Normalisation is genuinely per merchant (``groups=["merchant_id"]``); the
-     default ``GroupNormalizer()`` has ``groups=None`` and is global.
-  5. Train / validation / test are three disjoint time blocks, and validation is
-     restricted to merchants that are actually alive in the validation window.
 
 Usage
 -----
@@ -33,13 +15,6 @@ Usage
     python3 tft_revenue_v2.py --checkpoint <ckpt> --skip-train --forecast-merchant 171
     python3 tft_revenue_v2.py --refit-full --forecast-plots 25   # PNGs for the 25 biggest only
     python3 tft_revenue_v2.py --no-forecast-all       # only the one --forecast-merchant
-
-Every merchant that survives filter_series gets a forecast: one
-``v2_out/forecast_merchant/forecast_merchant_<id>.csv`` each (time_idx, date, p35, p50, p65,
-expected value), a chart beside it, and one row per merchant in ``v2_out/forecast_summary.csv``
-saying how far behind that merchant's data is, whether it had a trained embedding, and whether
-its level and dispersion checks pass.  Longer horizons than the trained 30 days are a separate
-question with a separate answer - see future_considerations.md.
 """
 
 from __future__ import annotations
@@ -62,11 +37,8 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import numpy as np
 import pandas as pd
 
-# BigQuery NUMERIC/DATE columns come back as db_dtypes extension dtypes.  The
-# original script only got away with reading the parquet because importing
-# google.cloud.bigquery registers them as a side effect; be explicit instead.
 try:  # pragma: no cover - environment dependent
-    import db_dtypes  # noqa: F401
+    import db_dtypes
 except ModuleNotFoundError:  # pragma: no cover
     pass
 
@@ -103,20 +75,10 @@ torch.set_float32_matmul_precision("high")
 # ======================================================================================
 # 0. The BigQuery feed
 # ======================================================================================
-# Changes from ``TFT model 1 final.py`` are marked CHANGED / NEW.  Everything this script
-# needs comes from these columns plus the extract's own calendar fields, so the parquet is
-# self-sufficient.
-#
-# IMPORTANT: the payouts exclusion below changes the TARGET DEFINITION, so it only takes
-# effect once you re-run this query.  ``training_data2.parquet`` was produced by the old
-# query and still has payouts inside daily_successful_amount_gbp - roughly 9% of the
-# target amount population-wide, and 100% of it for merchant 763.  Nothing in the parquet
-# lets the script subtract them after the fact: the extract carries payouts_amount, which
-# is a transaction COUNT, not the GBP value.  See MODEL_NOTES.md Part 4.2.
 
 # CHANGED: payouts are money leaving the merchant, not inbound processing volume, so
-# they no longer count as revenue.  Mean successful payout is GBP 509.55 against 
-# GBP 50.06 for card, so despite being only ~1% of transactions they are ~9% of the amount.
+# they no longer count as revenue.
+
 TRANSACTION_QUERY = """SELECT
     request_date,
     merchant_id,
@@ -191,9 +153,10 @@ ORDER BY
 # WHERE NOT (month_name IN ('June', 'July') AND calendar_year = 2026) --> for presentation
 # WHERE NOT (month_name = 'July' AND calendar_year = 2026) --> for presentation
 
-client = bigquery.Client(project = 'prj-p-dat-datawarehouse-90m9')
+client = bigquery.Client(project = '') # project not listed for privacy reasons
 df = client.query(TRANSACTION_QUERY).to_dataframe()
-# df.to_parquet("training_datajunjul.parquet") OR "training_datajul.parquet" OR "training_data.parquet"
+df.to_parquet("training_data.parquet") 
+# OR "training_datajul.parquet" OR "training_data.parquet"
 
 # 1. Configuration
 # ======================================================================================
@@ -201,7 +164,7 @@ df = client.query(TRANSACTION_QUERY).to_dataframe()
 class Config:
     data_path: str = "training_data.parquet" # Column names rather than actual variables, except data_path
     raw_target: str = "daily_successful_amount_gbp"   # tpv in GBP, as extracted
-    target: str = "tpv_log"                      # log1p of it - what the model fits
+    target: str = "tpv"                      # log1p of it - what the model fits
     group_col: str = "merchant_id"                   # one time series per value
     date_col: str = "request_date"
 
@@ -229,18 +192,8 @@ class Config:
     # Weight decay pulls the rarely-updated ones back toward zero in order to reduce overfitting risk
     weight_decay: float = 5e-3
     optimizer: str = "adamw"
-    # Larger than the previous 0.1, deliberately.  0.1 was compensating for a loss that
-    # could reach 25,000 in GBP; now that the loss is O(1) in log space, clipping at 0.1
-    # truncates almost every honest gradient and slows learning to a crawl.  0.5 still
-    # catches a genuine spike.
     gradient_clip_val: float = 0.5
-    group_id_dropout: float = 0.15  # cold-start robustness, see RevenueTFT
-    # 0.35 and 0.65 are here because they are what the forecast CSV reports: a narrow band
-    # either side of the median is the only part of a log-space predictive distribution that
-    # survives expm1 as a usable number.  They have to be in the trained set - QuantileLoss
-    # gives the head one output channel per level, so a quantile that was not trained cannot
-    # be interpolated afterwards.  The outer levels are kept for the coverage diagnostics in
-    # gbp_metrics(), which reference 0.1/0.9 and the extremes.
+    group_id_dropout: float = 0.15  # cold-start robustness
     quantiles: tuple[float, ...] = (0.02, 0.1, 0.25, 0.35, 0.5, 0.65, 0.75, 0.9, 0.98)
     # Levels written to forecast_merchant_<id>.csv, in order.
     report_quantiles: tuple[float, ...] = (0.35, 0.5, 0.65)
@@ -249,20 +202,12 @@ class Config:
     batch_size: int = 128
     max_epochs: int = 60 
     patience: int = 8 
-    train_batches_per_epoch: int = 400  # fixed step budget so epochs are comparable
+    train_batches_per_epoch: int = 400
     reduce_on_plateau_patience: int = 3
     num_workers: int | None = None
     seed: int = 42 
 
     # --- output -----------------------------------------------------------------------
-    # Terminal output still happens - every metric is printed.  The directory holds what a
-    # terminal cannot: predictions_holdout.csv (one row per merchant per forecast day with
-    # all seven quantiles - this is what you sort to find the merchants the model is worst
-    # at), forecast_merchant/forecast_merchant_<id>.csv for every merchant plus
-    # forecast_summary.csv over them, forecast_merchant_<id>.csv/.png for the one merchant
-    # reported verbatim on stdout, the example and interpretation plots, config.json,
-    # metrics.json, and the TensorBoard/CSV logs.  Nothing lands there that is not also
-    # summarised on stdout.
     outdir: str = "v2_out"
     # The one merchant that gets the long-form treatment: the full quantile table printed to
     # stdout, the per-merchant sanity checks in prose, and a csv/png at the top level of
@@ -270,22 +215,16 @@ class Config:
     # does every merchant including this one - it only decides which one is worth reading in
     # the terminal, and therefore which one gets a duplicate pair of files outside
     # forecast_dir.  "none" turns it off and leaves only the all-merchant pass.
-    forecast_merchant: str = "171"
+    forecast_merchant: str = "none"
     # Sub-directory of outdir holding one forecast_merchant_<id>.csv per merchant.  Its own
     # folder because there are ~380 of them and they would otherwise bury the ~15 files that
     # describe the run itself.
     forecast_dir: str = "forecast_merchant"
-    # PNGs written by the all-merchant pass: -1 = every merchant, 0 = none, N > 0 = the N
-    # largest by mean daily revenue.  Measured on this data (384 merchants, 882-day
-    # histories): the batched forward pass that produces all 384 forecasts takes 4s, and
-    # rendering all 384 charts takes 50s at 0.13s each for 58 MB of png.  So the charts do
-    # cost an order of magnitude more than the forecasts and are still under a minute against
-    # a training run of tens of minutes - which is why they are ON by default.  Set 0 if you
-    # only want the csvs, or N to cap it at the merchants that matter by revenue.
+    # PNGs written by the all-merchant pass: -1 = every merchant, 0 = none, N > 0 = the N largest by mean daily revenue. 
     forecast_plots: int = -1
     n_example_plots: int = 10
 
-    def as_dict(self) -> dict: # configures quantiles into a plain dict
+    def as_dict(self) -> dict: # configures quantiles into a plain dictionary
         as_plain_dict = asdict(self)
         as_plain_dict["quantiles"] = list(self.quantiles)
         as_plain_dict["report_quantiles"] = list(self.report_quantiles)
@@ -330,7 +269,7 @@ SOURCE_CALENDAR_COLS = [
 # `--selftest` validates the package against the warehouse over the range they overlap
 # (2024-01-01..2026-07-27) and asserts set equality on all 21 flagged dates, so the
 # convention is checked rather than assumed before it is relied on for the future.
-UK_HOLIDAY_SUBDIVISION = "England"  # England & Wales share the same bank holidays
+UK_HOLIDAY_SUBDIVISION = "England"
 
 
 def uk_bank_holidays_between(start, end) -> pd.DatetimeIndex:
@@ -488,7 +427,7 @@ def add_calendar_features(df: pd.DataFrame, date_col: str = "request_date",
     position_in_month = (day_number.astype(np.float64) - 1.0) / month_length
     for harmonic in (1, 2):
         angle = 2.0 * np.pi * harmonic * position_in_month
-        df[f"month_sin{harmonic}"] = np.sin(angle)
+        df[f"month_sin{harmonic}"] = np.sin(angle) # again, to normalise the differences between nearby days in different months
         df[f"month_cos{harmonic}"] = np.cos(angle)
 
     # --- pay-cycle / month-boundary flags -------------------------------------------
@@ -509,13 +448,15 @@ def add_calendar_features(df: pd.DataFrame, date_col: str = "request_date",
     # before and suppressed in the days after.  A binary flag cannot express that, so this
     # gives the network a ramp: negative = that many days after the most recent holiday,
     # positive = that many days before the next one, 0 = the holiday itself.
-    #
+    
+
     # Implementation: take every holiday date known to this frame (warehouse + forward
     # list) as sorted integer nanoseconds. np.searchsorted finds, for each row's date,
     # where it would slot into that sorted array - so the entry before that position is the
     # previous holiday and the entry at it is the next one.  Convert both gaps to days,
     # keep whichever is closer, sign it, and clip to +/-10 so a date in the middle of a
     # holiday-free stretch does not become a huge outlier.
+
     if len(known_holidays):
         holiday_ns = known_holidays.asi8.astype(np.int64)
         date_ns = dates.astype("int64").to_numpy()
@@ -537,8 +478,6 @@ def add_calendar_features(df: pd.DataFrame, date_col: str = "request_date",
 # ======================================================================================
 
 ZERO_ON_INACTIVE_DAY_COLS = [
-    # Kept in this list even though log_txn_count was dropped as a model input: the column
-    # is still needed to zero-fill inserted grid rows and to derive had_no_attempts.
     # Note every "*_amount" column in this extract is a COUNT, not a currency amount.
     "daily_transaction_amount",
     "daily_successful_transaction_count",
@@ -547,6 +486,7 @@ ZERO_ON_INACTIVE_DAY_COLS = [
     "daily_fraud_amount",
     "daily_dispute_amount",
 ]
+
 ACQUIRER_COLS = [
     "migration_amount", "acquired_amount", "trust_amount", "unknown_amount",
     "cashflows_amount", "barclaycard_amount", "lloyds_amount", "shift4_amount",
@@ -560,22 +500,15 @@ PAYMENT_COLS = [
     "card_amount", "dd_amount", "pbb_amount", "payouts_amount", "bacs_amount", "vrp_amount",
 ]
 
-# ``rest``/``core`` are not columns in this extract - ``integration_api`` is a single
-# string column whose values are 'core' (89,316 rows) and 'rest' (82,949).  Naming them
-# here as if they were per-day counts silently produced nothing, because every ratio
-# group is filtered by ``if col in df.columns``.  These are the names the SQL below now
-# creates, so the ratios switch on automatically once you re-run the query; until then
-# ``build_ratio_features`` prints that it skipped the group.
 INTEGRATION_COLS = ["core_amount", "rest_amount"]
 
 # Card-scheme columns dropped: they are absent from this extract, and in the raw
 # transaction data ``card_scheme`` is 68% 'unknown', so they would be mostly noise.
 
-# Verified 100% constant per merchant_id in the extract.
 STATIC_ATTR_COLS = [
     "merchant_category", "sector_group", "iso_name",
     "merchant_name", "merchant_created_datetime",
-]
+] # static attributes
 
 def load_frame(path: str) -> pd.DataFrame:
     print(f"[data] reading {path}")
@@ -599,9 +532,6 @@ def coerce_dtypes(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     df[cfg.date_col] = pd.to_datetime(df[cfg.date_col]).dt.normalize()
     df[cfg.group_col] = df[cfg.group_col].astype("string").astype(str).str.strip()
 
-    # Every column that must end up as a plain numpy float.  dict.fromkeys() de-duplicates
-    # while preserving order - daily_successful_transaction_count is in two of these groups.
-    # This is not the ratio calculation; that is build further down in engineer_features.
     numeric_cols = (
         ZERO_ON_INACTIVE_DAY_COLS + ACQUIRER_COLS + RESPONSE_COLS + PAYMENT_COLS
         + INTEGRATION_COLS
@@ -618,9 +548,8 @@ def coerce_dtypes(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     tpv = df[cfg.raw_target]
     success_count = df.get("daily_successful_transaction_count")
     if success_count is not None:
-        # target_imputed marks rows whose revenue we had to invent.  It is NOT the daily
-        # grid fill (that is to_daily_grid); it is only these NULL-revenue-but-transactions
-        # rows.  It goes into the encoder so the model can learn to discount them.
+        # target_imputed marks rows whose revenue we had to average out,
+        # it goes into the encoder so the model can learn to discount them.
         is_missing_tpv = tpv.isna() & (success_count.fillna(0) > 0)
         df["target_imputed"] = is_missing_tpv.astype(np.float32)
         if int(is_missing_tpv.sum()):
@@ -642,9 +571,6 @@ def coerce_dtypes(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         if col not in df.columns:
             continue
         if col == "merchant_created_datetime":
-            # tz-aware UTC in the extract while request_date is a naive date.  Strip the
-            # zone *and* the time-of-day: keeping 14:05 on the creation timestamp makes
-            # a same-day transaction floor to -1 days (14 rows in the extract do this).
             s = pd.to_datetime(df[col], utc=True, errors="coerce")
             df[col] = s.dt.tz_localize(None).dt.normalize()
         else:
@@ -659,14 +585,6 @@ def coerce_dtypes(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 def to_daily_grid(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
 # Reindex every merchant onto a complete daily calendar.
-
-# A day on which a merchant processed nothing is a day of GBP 0 revenue, not a
-# missing observation.  The original script instead passed
-# ``allow_missing_timesteps=True``, which does not fill anything - it merely
-# lets adjacent encoder positions be far apart in real time.  With only 71%
-# grid completeness (median largest gap 12 days, p95 138 days) a nominal
-# "150-day encoder" could span well over a year of wall-clock, which destroys
-# the weekly and annual structure the model is supposed to learn.
     
     data = df.sort_values([cfg.group_col, cfg.date_col]).reset_index(drop=True)
 
@@ -686,7 +604,7 @@ def to_daily_grid(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
 
     # Left-join the observed rows onto the complete grid: every calendar day survives, and
     # days the extract never had become all-NaN rows, which the fills below turn into
-    # explicit zeros.  The printed counts are observed rows -> grid rows.
+    # explicit zeros.
     rows_before_fill = len(data)
     data = full_grid.merge(data, on=[cfg.group_col, cfg.date_col], how="left")
     print(f"[grid] {rows_before_fill:,} observed rows -> {len(data):,} grid rows "
@@ -707,10 +625,6 @@ def to_daily_grid(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     if "target_imputed" in data.columns:
         data["target_imputed"] = data["target_imputed"].fillna(0.0).astype(np.float32)
 
-    # Merchant attributes ("attr") are properties of the merchant, not per-day flows, so
-    # they are carried across the inserted rows instead of zeroed.  ffill propagates the
-    # last known value forward; the following bfill covers a merchant whose very first grid
-    # row was inserted, which ffill alone would leave as NaN.
     attr_cols = [c for c in STATIC_ATTR_COLS if c in data.columns]
     data[attr_cols] = data.groupby(cfg.group_col, observed=True)[attr_cols].ffill()
     data[attr_cols] = data.groupby(cfg.group_col, observed=True)[attr_cols].bfill()
@@ -757,7 +671,7 @@ def engineer_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     # every merchant.  That is what lets train/val/holdout be cut at shared indices.
     data["time_idx"] = ((data[cfg.date_col] - data[cfg.date_col].min()).dt.days).astype(np.int64)
     min_date = data[cfg.date_col].min()
-    # ...and series_start_idx records where each merchant's own series begins on that shared
+    # series_start_idx records where each merchant's own series begins on that shared
     # axis (merchant 171 -> 871).  It is a cohort marker: nothing is renumbered to 0, and an
     # encoder window starting at day 778 keeps time_idx 778.
     data["series_start_idx"] = (
@@ -768,9 +682,8 @@ def engineer_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     data = add_calendar_features(data, cfg.date_col)
 
     # --- merchant age ---------------------------------------------------------------
-    # log1p here is not about skew (age is roughly uniform, 0..3843 days).  It is about
-    # what the feature is FOR: the difference between day 10 and day 100 of a merchant's
-    # life is a real behavioural change - onboarding, ramp-up - while the difference
+    # log1p here is not about skew, it is about what the feature is FOR: the difference between
+    # day 10 and day 100 of a merchant's life is a real behavioural change - onboarding, ramp-up - while the difference
     # between day 3000 and day 3090 is nothing at all.  On a linear scale those two gaps
     # are identical to the network; on a log scale the first is 2.3 units and the second
     # 0.03.  Both raw and log forms are kept: since_merchant_creation feeds the
@@ -789,50 +702,32 @@ def engineer_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         age_at_first_sale.to_numpy()
     ).astype(np.float32)
 
-    # --- heavy-tailed observed reals -> log1p ---------------------------------------
-    # These six columns are scaled by ONE GLOBAL sklearn StandardScaler, because
-    # TimeSeriesDataSet does `self._scalers[name] = StandardScaler().fit(data[[name]])`
-    # per column with no notion of groups (_timeseries.py:1256-1262) and build_datasets
-    # never overrides it.  Measured on the prepared frame, that is ruinous on the raw
-    # scale: 94-98% of all rows land inside the BOTTOM 1% of each column's z range,
-    # interquartile range over full range is 3.4e-4 to 1.2e-3, and the 4.67% of rows
-    # belonging to 14 whale merchants carry 77-97% of the total sum of squares.  For a
-    # merchant averaging GBP 482/day, a GBP 20 day and a GBP 900 day - a 45x move - differ
-    # by z = 0.0065, which is 0.0058% of the input range and 1/8300th of the gap between
-    # two ordinary days of merchant 171.
-    #
-    # After log1p the same 45x move is z = 1.02, statistically the same size (0.97x) as a
-    # whale's 38x move; every size band gets 0.55-0.80 sd of internal resolution instead of
-    # 0.0014/0.0063/0.045 for the three smallest; the whale share of sum-of-squares falls to
-    # 7-17%; and Spearman(scaled, raw) = 1.000000, so no ordering information is lost.
-    # `--selftest` re-measures this and asserts the key thresholds, so the claim is checked
-    # rather than trusted.  Caveat: fraud and dispute counts are 91.6%/90.3% zeros, so they
-    # stay near-indicators either way (z(max) still +10.7/+10.3); log1p is doing the real
-    # work on the dense columns.  note this argument does NOT cover the target - that is
-    # scaled per merchant by FlooredGroupNormalizer, and its log1p is justified separately
-    # by the loss geometry (MODEL_NOTES.md 2.1).
+
     txn_count = data["daily_transaction_amount"].to_numpy()
     success_count = data["daily_successful_transaction_count"].to_numpy()
     # log_txn_count dropped as a model input: it scored 0.60% encoder importance in v1 and
     # is near-collinear with log_success_count.  The column is still read here because
     # had_no_attempts needs it, and that flag is the part that carries signal.
     data["log_success_count"] = np.log1p(success_count).astype(np.float32)
+
     data["log_unsuccessful_gbp"] = np.log1p(
         data["daily_unsuccessful_amount_gbp"].to_numpy()
     ).astype(np.float32)
+
     data["log_fraud_count"] = np.log1p(data["daily_fraud_amount"].to_numpy()).astype(np.float32)
+
     data["log_dispute_count"] = np.log1p(
         data["daily_dispute_amount"].to_numpy()
     ).astype(np.float32)
-    # Revenue = transactions x average ticket, and the two move for different reasons: a
-    # merchant can hold volume while its basket shrinks.  Giving the encoder the
-    # decomposition saves it from having to infer the ratio.
+
     data["log_avg_ticket"] = np.log1p(
         safe_divide(data[cfg.raw_target].to_numpy(), np.maximum(success_count, 0))
     ).astype(np.float32)
+
     # is_zero_day: earned nothing.  had_no_attempts: nobody even tried.  Different events -
     # the first can mean every transaction was declined, the second means the merchant was
     # dormant - and with 20% of grid days at zero revenue the distinction matters.
+    
     data["is_zero_day"] = (data[cfg.raw_target].to_numpy() <= 0).astype(np.float32)
     data["had_no_attempts"] = (txn_count <= 0).astype(np.float32)
 
@@ -865,6 +760,7 @@ def engineer_features(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
         "is_uk_bank_holiday", "merchant_category", "sector_group",
         "iso_name"
     ]
+
     for col in categorical_cols:
         if col in data.columns:
             data[col] = data[col].astype(str)
@@ -924,30 +820,29 @@ def filter_series(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     return out
 
 
+# Drop reals that are (near) constant on the training block.
+
+#     Constant inputs still consume a slot in the variable-selection softmax, which is part
+#     of why the original model's encoder importance chart was a long tail of
+#     indistinguishable near-zero bars (top variable 6.87%, top three 17.9%).
+
+#     ``tol`` is an absolute threshold on the standard deviation, in each column's own
+#     units.  Every column reaching here is either a [0,1] ratio or a log1p value, so 1e-6
+#     means "this column is the same number in every training row" rather than any
+#     scale-dependent judgement.  Measured on the training block only, so a feature that
+#     only starts varying inside the validation window is correctly treated as unusable.
+
+
 def prune_uninformative(df: pd.DataFrame, cols: list[str], cutoff: int, cfg: Config,
                         tol: float = 1e-6) -> list[str]:
-    """Drop reals that are (near) constant on the training block.
-
-    Constant inputs still consume a slot in the variable-selection softmax, which is part
-    of why the original model's encoder importance chart was a long tail of
-    indistinguishable near-zero bars (top variable 6.87%, top three 17.9%).
-
-    ``tol`` is an absolute threshold on the standard deviation, in each column's own
-    units.  Every column reaching here is either a [0,1] ratio or a log1p value, so 1e-6
-    means "this column is the same number in every training row" rather than any
-    scale-dependent judgement.  Measured on the training block only, so a feature that
-    only starts varying inside the validation window is correctly treated as unusable.
-    """
+    
     train = df.loc[df["time_idx"] <= cutoff, cols]
-    # numeric_only=True makes std() skip any non-numeric column instead of raising; it is
-    # defensive only, since everything in `cols` should already be a float.
     std = train.std(numeric_only=True)
     keep = [c for c in cols if float(std.get(c, 0.0)) > tol]
     dropped = sorted(set(cols) - set(keep))
     if dropped:
         print(f"[prune] dropping {len(dropped)} constant/near-constant reals: {dropped}")
     return keep
-
 
 # ======================================================================================
 # 5. Normaliser with a scale floor
@@ -973,11 +868,6 @@ class FrozenGroupIdEncoder(NaNLabelEncoder):
        lands one code past the end.  ``classes_vector_`` is then shorter than the largest
        code it contains, which both corrupts ``inverse_transform`` and pushes codes past the
        end of the merchant embedding table sized from the training dataset.
-
-    Freezing solves both: validation, holdout and forecast frames reuse the training codes
-    verbatim, and a merchant absent from the training block transforms to 0 - the unknown
-    token the merchant embedding is trained to handle via ``group_id_dropout``, and a code
-    that is deliberately missing from ``norm_`` so the median fallback applies.
     """
 
     def fit(self, y, overwrite: bool = False):
@@ -1007,9 +897,6 @@ class FlooredGroupNormalizer(GroupNormalizer):
     """
 
     def __init__(self, *args, scale_floor: float = 0.25, **kwargs):
-        # scale_floor is set before super().__init__ because sklearn's BaseEstimator
-        # introspects __init__ arguments; *args/**kwargs forward everything else
-        # (method, groups, center, ...) to GroupNormalizer unchanged.
         self.scale_floor = scale_floor
         super().__init__(*args, **kwargs)
 
@@ -1076,14 +963,12 @@ class RevenueTFT(TemporalFusionTransformer):
         super().__init__(*args, **kwargs)
         self.group_id_dropout = float(group_id_dropout)
         self.log_gbp_metrics = bool(log_gbp_metrics)
-        # Persist them so a reloaded checkpoint reports how it was trained.
         try:
             self.hparams["group_id_dropout"] = float(group_id_dropout)
             self.hparams["log_gbp_metrics"] = bool(log_gbp_metrics)
         except Exception:  # pragma: no cover
             pass
 
-    # -- lazily resolve which column of x_cat holds the group id ---------------------
     @property
     def group_cat_index(self) -> int | None:
         """Position of merchant_id inside the categorical input tensor, or None.
@@ -1104,9 +989,6 @@ class RevenueTFT(TemporalFusionTransformer):
         return cached
 
     def forward(self, x: dict[str, torch.Tensor], **kwargs):
-        """One forward pass.  Overridden only to apply merchant-id dropout in training.
-        Dropout is when certain nodes randomly switch off during training process in order to reduce risk of overfitting and minimize val loss
-        """
         if self.training and self.group_id_dropout > 0.0:
             j = self.group_cat_index
             if j is not None:
@@ -1151,12 +1033,10 @@ class RevenueTFT(TemporalFusionTransformer):
                              on_step=False, on_epoch=True, batch_size=actual.size(0))
                     # MAE_gbp and RMSE_gbp are kept because they answer the "is it right in
                     # money" question, but read them with care and NOT as an epoch-to-epoch
-                    # signal.  expm1 turns a log-space error into a MULTIPLICATIVE one, so a
-                    # single overshoot on a merchant doing GBP 15.2M/day dominates the mean
+                    # signal.  expm1 turns a log-space error into a multiplicative one, so a
+                    # single overshoot on a merchant doing very high GBP a day dominates the mean
                     # over ~175k validation points - which is why MAE_gbp can rise while
-                    # MAE_log falls.  That is the same arithmetic that made a GBP-space LOSS
-                    # untrainable (MODEL_NOTES.md Part 1, D2); it applies just as much to a
-                    # GBP-space metric.  Judge progress on MAE_log and MedAE_gbp, and use
+                    # MAE_log falls. Judge progress on MAE_log and MedAE_gbp, and use
                     # MAE_gbp/RMSE_gbp only on the final holdout report, where the per-size-
                     # band table shows where the error actually sits.
                     self.log(f"{self.current_stage}_MAE_gbp", error.mean(),
@@ -1185,7 +1065,6 @@ def stride_windows(ds: TimeSeriesDataSet, stride: int) -> TimeSeriesDataSet:
     ds.index = idx.loc[keep].reset_index(drop=True)
     return ds
 
-
 @dataclass
 class Split:
     training: TimeSeriesDataSet
@@ -1202,9 +1081,6 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
     max_t = int(df["time_idx"].max())
     val_cutoff = max_t - cfg.horizon
     sel_cutoff = val_cutoff - cfg.val_days
-    # ``full=True`` trains on every day for the production forecast; the validation and
-    # holdout blocks keep the *same* definitions so the curves stay comparable, but they
-    # are then in-sample and must not be used for model selection.
     train_cutoff = max_t if full else sel_cutoff
 
     known_reals = (
@@ -1213,7 +1089,7 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
         + ["is_month_start", "is_month_end", "is_payday_window", "is_quarter_end",
            "days_to_month_end", "holiday_offset", "log_merchant_age"]
     )
-    # NOTE: raw ``time_idx`` is deliberately *not* a known real.  The original model
+    # Note: raw ``time_idx`` is deliberately *not* a known real.  The original model
     # had it, which lets the network fit a level against absolute time and then
     # extrapolate off the end of the training range - every forecast day sits beyond
     # anything the scaler ever saw.  ``add_relative_time_idx`` gives position within
@@ -1224,10 +1100,8 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
     # TemporalFusionTransformer.forward reads only ``encoder_cont``/``encoder_cat``
     # (``encoder_target`` is used only by MASE-style losses).  Omitting it - as both
     # the original script and the notebook did - builds a TFT whose encoder never
-    # sees a single past revenue value.  That is why the published attention plot is
-    # a smooth recency ramp with no bump at lag 7/14/21/28: there was no periodic
-    # signal in the encoder to attend to.  pytorch_forecasting keeps it out of
-    # ``decoder_variables``, so there is no leakage into the horizon.
+    # sees a single past revenue value.
+
     unknown_reals = [
         cfg.target,
         "log_success_count", "log_unsuccessful_gbp",
@@ -1237,34 +1111,16 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
     unknown_reals += list(df.attrs.get("ratio_names", []))
     unknown_reals = [c for c in dict.fromkeys(unknown_reals) if c in df.columns]
     unknown_reals = prune_uninformative(df, unknown_reals, train_cutoff, cfg)
-    # A bare `assert` raises AssertionError with this message if the condition is false.
-    # It is here because this exact omission is what broke the previous model, silently:
-    # without the target in unknown_reals the script still trains, still reports a falling
-    # loss, and still plots the observed history (plot_prediction reads encoder_target,
-    # which the network never sees) - so nothing looks wrong.
     assert cfg.target in unknown_reals, (
         f"{cfg.target!r} must stay in time_varying_unknown_reals or the encoder cannot "
         "see revenue history"
     )
 
-    # merchant_id must be listed explicitly.  TimeSeriesDataSet does *not* fold
-    # group_ids into static_categoricals (``categoricals`` is exactly
-    # static + known + unknown categoricals), so the original model - which also
-    # omitted it - had no merchant-identity embedding whatsoever: with a global
-    # target normaliser on top, nothing in the network could tell one merchant from
-    # another except its sector labels and its own encoder history.
     static_cats = [cfg.group_col, "merchant_category", "sector_group",
                    "iso_name"]
     static_cats = [c for c in static_cats if c in df.columns]
     static_reals = ["series_start_idx", "log_tenure_at_series_start"]
 
-    # day_type is deliberately absent: it is a deterministic function of day_of_week and
-    # is_uk_bank_holiday (verified on all 939 dates - 'Holiday' iff is_uk_bank_holiday,
-    # 'Weekend' iff dayofweek >= 5), so including all three feeds the variable-selection
-    # softmax a perfectly collinear triple and splits its attention across duplicates.
-    # day_of_week is kept over day_type because day_type collapses Saturday and Sunday,
-    # which behave differently.  acquiring_bank_name is absent because the per-day acquirer
-    # mix ratios already carry it - see MODEL_NOTES.md for what that costs.
     known_cats = ["day_of_week", "day_of_month", "calendar_month",
                   "is_uk_bank_holiday"]
     known_cats = [c for c in known_cats if c in df.columns]
@@ -1272,43 +1128,6 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
     all_cats = list(dict.fromkeys([cfg.group_col] + static_cats + known_cats))
     categorical_encoders = {c: NaNLabelEncoder(add_nan=True) for c in all_cats}
 
-    # ------------------------------------------------------------------------------------
-    # THE OFF-BY-ONE THAT MADE EVERY ORIGINAL FORECAST WRONG.  TimeSeriesDataSet keeps TWO separate
-    # encodings of the group column:
-    #
-    #   1. ``merchant_id`` itself - a model input, encoded with the encoder supplied above.
-    #      Because the target normaliser is a GroupNormalizer, _preprocess_data() encodes
-    #      this column BEFORE fitting the normaliser, so ``norm_`` ends up indexed by these
-    #      codes.  add_nan=True reserves 0 for the unknown token, so real merchants are
-    #      1..N.
-    #   2. ``__group_id__merchant_id`` - the series identifier that lands in
-    #      ``data["groups"]``.  _preprocess_data() builds it from
-    #      ``categorical_encoders.get("__group_id__merchant_id", NaNLabelEncoder())`` - a
-    #      DEFAULT NaNLabelEncoder, i.e. add_nan=False, i.e. 0..N-1.
-    #
-    # __getitem__ then does ``target_scale = target_normalizer.get_parameters(groups)``,
-    # looking encoding 2 up in a table keyed by encoding 1.  Every series was therefore
-    # centred and scaled with the PREVIOUS merchant's parameters, and the merchant at code 0
-    # fell through the KeyError branch onto the global median.  Because the target is
-    # log1p(revenue), a wrong centre is a multiplicative error once expm1 undoes it: lending
-    # merchant 991 its neighbour's centre (8.96 instead of 6.72) multiplies its forecast by
-    # e^2.24 = 9.4x, and a wrong scale stretches the quantile spread by the same mechanism.
-    # That is where the GBP 30m p98 came from - not from log1p amplifying an honest error.
-    #
-    # The fix is to register the group-id encoder explicitly and to pre-fit BOTH encodings on
-    # the same id list, so they are the same function by construction.  Two details matter:
-    #
-    #   * The id list is every merchant in ``df``, not just the training block.  A series
-    #     identifier has to be unique per series - if the merchants missing from the training
-    #     block all collapsed onto the unknown token, TimeSeriesDataSet would treat them as
-    #     ONE series and reject the frame for having non-consecutive time steps.
-    #   * FrozenGroupIdEncoder rather than NaNLabelEncoder, because TimeSeriesDataSet re-fits
-    #     this particular encoder on every construction - see its docstring.
-    #
-    # ``norm_`` is still fitted on the training block alone, so it simply has no row for a
-    # merchant that never appears there, and the median fallback applies to it.  That is the
-    # intended cold-start path.  assert_target_scales_aligned() below fails the run if these
-    # two encodings ever drift apart again.
     every_merchant = pd.Series(sorted(df[cfg.group_col].unique()))
     categorical_encoders[cfg.group_col] = NaNLabelEncoder(add_nan=True).fit(every_merchant)
     categorical_encoders[f"__group_id__{cfg.group_col}"] = (
@@ -1317,9 +1136,6 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
 
     train_df = df[df["time_idx"] <= train_cutoff].reset_index(drop=True)
     if full:
-        # Printed differently because "(939, 909]" is an empty interval and reads as a bug.
-        # In full mode training covers everything, so the val and holdout blocks keep their
-        # definitions only so the loss curves stay comparable - they are now in-sample.
         print(
             f"[split] FULL REFIT: max_time_idx={max_t}  train<= {train_cutoff} (everything)  "
             f"val ({sel_cutoff}, {val_cutoff}] and holdout ({val_cutoff}, {max_t}] are now "
@@ -1334,33 +1150,33 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
 
     training = TimeSeriesDataSet(
         train_df,
-        time_idx="time_idx",
-        target=cfg.target,
-        group_ids=[cfg.group_col],
-        categorical_encoders=categorical_encoders,
-        min_encoder_length=cfg.min_encoder_length,
-        max_encoder_length=cfg.max_encoder_length,
-        min_prediction_length=cfg.horizon,
-        max_prediction_length=cfg.horizon,
-        static_categoricals=static_cats,
-        static_reals=static_reals,
-        time_varying_known_categoricals=known_cats,
-        time_varying_known_reals=known_reals,
-        time_varying_unknown_categoricals=[],
-        time_varying_unknown_reals=unknown_reals,
-        target_normalizer=FlooredGroupNormalizer(
-            method="standard", groups=[cfg.group_col], center=True, scale_floor=0.25
+        time_idx = "time_idx",
+        target = cfg.target,
+        group_ids = [cfg.group_col],
+        categorical_encoders = categorical_encoders,
+        min_encoder_length = cfg.min_encoder_length,
+        max_encoder_length = cfg.max_encoder_length,
+        min_prediction_length = cfg.horizon,
+        max_prediction_length = cfg.horizon,
+        static_categoricals = static_cats,
+        static_reals = static_reals,
+        time_varying_known_categoricals = known_cats,
+        time_varying_known_reals = known_reals,
+        time_varying_unknown_categoricals = [],
+        time_varying_unknown_reals = unknown_reals,
+        target_normalizer = FlooredGroupNormalizer(
+            method = "standard", groups = [cfg.group_col], center = True, scale_floor = 0.25
         ),
-        add_relative_time_idx=True,
-        add_target_scales=True,
-        add_encoder_length=True,
-        allow_missing_timesteps=False,
-        randomize_length=None,
+        add_relative_time_idx = True,
+        add_target_scales = True,
+        add_encoder_length = True,
+        allow_missing_timesteps = False,
+        randomize_length = None,
     )
 
     validation = TimeSeriesDataSet.from_dataset(
         training,
-        df[df["time_idx"] <= val_cutoff].reset_index(drop=True),
+        df[df["time_idx"] <= val_cutoff].reset_index(drop = True),
         min_prediction_idx=sel_cutoff + 1,
         stop_randomization=True,
         predict=False,
@@ -1390,22 +1206,12 @@ def build_datasets(df: pd.DataFrame, cfg: Config, full: bool = False) -> Split:
         time_varying_known_reals=known_reals,
         time_varying_unknown_reals=unknown_reals,
     )
-    # Split is a plain container (a dataclass): the three TimeSeriesDataSets plus the
-    # cutoff indices and the feature lists, so callers do not have to recompute them.
-    # No percentages - `spec` is written to config.json as a record of what went in.
     return Split(training, validation, holdout, train_cutoff, val_cutoff, max_t, spec)
 
 
 def assert_target_scales_aligned(dataset: TimeSeriesDataSet, df: pd.DataFrame, cfg: Config,
                                  train_cutoff: int, label: str, n_check: int = 24) -> None:
-    """Fail loudly if a window's target_scale is not that window's own merchant's.
-
-    The bug this guards against is invisible in every metric: a series normalised with its
-    neighbour's centre still trains, still shows a falling loss, and still plots a sensible
-    log-space curve.  It only surfaces after expm1, as a forecast that is a constant
-    multiple out.  So the check has to be explicit and it has to compare against numbers
-    recomputed from the dataframe rather than from anything the dataset derived.
-
+    """
     ``groups`` is decoded back to a merchant id through the dataset's own group-id encoder,
     then that merchant's centre and scale are recomputed from the training block and matched
     against the ``target_scale`` the dataset actually hands the model.  Cold-start merchants
@@ -1502,11 +1308,7 @@ def gbp_metrics(actual_gbp: np.ndarray, q_gbp: np.ndarray, quantiles: list[float
     smape_terms = np.abs(error) / np.maximum(
         (np.abs(actual) + np.abs(median_pred)) / 2.0, 1e-9
     )
-    # Coverage: how often the actual really landed inside a predicted band.  The outer band
-    # is the first and last quantile supplied; the p10-p90 one is only defined if those two
-    # levels were actually requested, hence the NaN default rather than a wrong number.
-    # Index by the smallest and largest LEVEL rather than by position, so the outer band is
-    # still the outer band if cfg.quantiles is ever passed unsorted.
+    # Coverage: how often the actual really landed inside a predicted band.
     lowest = int(np.argmin(quantiles))
     highest = int(np.argmax(quantiles))
     coverage_outer = (
@@ -1583,10 +1385,7 @@ def naive_baselines(df: pd.DataFrame, frame: pd.DataFrame, cfg: Config) -> dict:
     weekdays, which is weaker and would flatter the model.
 
     Alignment: the day predicted at ``step`` has ``time_idx = origin + step``, where
-    ``origin`` is the last OBSERVED index.  We want a key ``origin - back`` whose weekday
-    matches, i.e. ``(origin + step) - (origin - back) = step + back`` divisible by 7, so
-    ``back = (-step) % 7``.  Worked through: step 1 -> back 6 (gap 7), step 7 -> back 0
-    (gap 7), step 8 -> back 6 (gap 14).  Asserted below.
+    ``origin`` is the last OBSERVED index.
     """
     history = df[[cfg.group_col, "time_idx", cfg.raw_target]].copy()
     lookup = history.set_index([cfg.group_col, "time_idx"])[cfg.raw_target]
@@ -1634,27 +1433,6 @@ def naive_baselines(df: pd.DataFrame, frame: pd.DataFrame, cfg: Config) -> dict:
 # ======================================================================================
 def append_future_rows(history: pd.DataFrame, cfg: Config, horizon: int | None = None,
                        ratio_names: list[str] | None = None) -> pd.DataFrame:
-    """History + ``horizon`` future rows, for ONE merchant or for every merchant at once.
-
-    Only the encoder needs observed values; the decoder needs the *known*
-    covariates to be right.  So the future rows recompute every calendar feature
-    from the date via ``add_calendar_features`` - the same function the training
-    frame used - and forward-fill only the things that are genuinely known in
-    advance (sector, ISO, current acquirer, integration).  Unknown reals and the
-    target are set to 0 in the decoder; pytorch_forecasting never reads them.
-
-    There is one function rather than a single-merchant and a batch version because the
-    horizon rows ARE the decoder input: if the two paths ever disagreed about how a future
-    row is built, ``forecast_merchant`` and ``forecast_all_merchants`` would return different
-    numbers for the same merchant and nothing would say so.  ``--selftest`` asserts they
-    agree row-for-row.
-
-    Each merchant's block is anchored on that merchant's OWN last observed day, which is what
-    ``predict_mode`` does for a window and therefore the only anchor that keeps the encoder
-    contiguous with the decoder.  For a merchant that stopped trading a year ago that means
-    the "forecast" dates are in the past; forecast_all_merchants reports the staleness per
-    merchant rather than quietly dropping or re-anchoring them.
-    """
     # `horizon if horizon is not None else cfg.horizon`: let a caller override the horizon
     # for one call without changing the config.  Written explicitly rather than as
     # `horizon or cfg.horizon`, because `or` also replaces a deliberate 0.
